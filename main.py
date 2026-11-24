@@ -2,6 +2,8 @@ import socket
 import base64
 import ast
 import asyncio
+import logging
+import sys
 import unicodedata
 from collections import deque
 import datetime
@@ -50,6 +52,7 @@ class AviylBot(commands.Bot):
         self.http_session: aiohttp.ClientSession | None = None
         self.dashboard_runner: web.AppRunner | None = None
         self.dashboard_site: web.TCPSite | None = None
+        self._housekeeping_task: asyncio.Task | None = None
         self.dashboard_port: int = int(
             os.getenv("SERVER_PORT")
             or os.getenv("PORT")
@@ -70,9 +73,18 @@ class AviylBot(commands.Bot):
             connector=connector,
             timeout=aiohttp.ClientTimeout(total=90, connect=8, sock_connect=8),
         )
+        # Background housekeeping: bounded-memory pruning of transient caches (started lazily,
+        # the task body itself is defined later in the module and resolved at call time).
+        self._housekeeping_task = asyncio.create_task(_housekeeping_loop())
         await start_wispbyte_dashboard(self)
 
     async def close(self):
+        if self._housekeeping_task is not None:
+            self._housekeeping_task.cancel()
+            try:
+                await self._housekeeping_task
+            except (asyncio.CancelledError, Exception):
+                pass
         if self.dashboard_runner is not None:
             try:
                 await self.dashboard_runner.cleanup()
@@ -124,6 +136,40 @@ def _atomic_write_json(filepath: str, data) -> bool:
             except Exception:
                 pass
             return False
+
+
+# ==========================================
+# 📊 STRUCTURED DIAGNOSTIC LOGGING
+# ==========================================
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s | %(levelname)-7s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    stream=sys.stdout,
+)
+APP_LOG = logging.getLogger("aviyl")
+
+
+def log_event(level: str, event: str, **fields) -> None:
+    """
+    Structured single-line diagnostic log: `<event> | key=<json-value> ...`.
+    Never raises — logging must never take the bot down.
+    """
+    try:
+        parts = []
+        for k, v in fields.items():
+            try:
+                parts.append(f"{k}={json.dumps(v, ensure_ascii=False, default=str)}")
+            except Exception:
+                parts.append(f"{k}={v!r}")
+        APP_LOG.log(
+            getattr(logging, str(level).upper(), logging.INFO),
+            "%s | %s",
+            event,
+            " ".join(parts),
+        )
+    except Exception:
+        pass
 
 
 class BotCustomStatusActivity(discord.BaseActivity):
@@ -352,8 +398,43 @@ def record_user_chat_turn(user_id: int, role_label: str, text_val: str, persist:
         oldest_uid = next(iter(USER_CHAT_MEMORY))
         USER_CHAT_MEMORY.pop(oldest_uid, None)
     if persist:
-        serializable = {str(uid): list(turns) for uid, turns in USER_CHAT_MEMORY.items()}
-        _atomic_write_json(CHAT_MEMORY_FILE, serializable)
+        _request_chat_memory_persist()
+
+
+# Single-flight micro-batch flush state for chat-memory persistence
+_CHAT_MEMORY_FLUSH_TASK: asyncio.Task | None = None
+
+
+def _serialize_chat_memory() -> dict:
+    return {str(uid): list(turns) for uid, turns in USER_CHAT_MEMORY.items()}
+
+
+def _request_chat_memory_persist() -> None:
+    """
+    Schedules the chat-memory disk write on the event loop WITHOUT blocking it.
+    The actual `json.dump` + `os.fsync` happens in a short deferred task (micro-batched),
+    so rapid consecutive turns coalesce into one disk write. In-memory state (the source
+    of truth for conversations) is still updated synchronously by the caller.
+    """
+    global _CHAT_MEMORY_FLUSH_TASK
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        # Called outside any event loop (e.g. interpreter shutdown path) — write directly.
+        _atomic_write_json(CHAT_MEMORY_FILE, _serialize_chat_memory())
+        return
+
+    if _CHAT_MEMORY_FLUSH_TASK is not None and not _CHAT_MEMORY_FLUSH_TASK.done():
+        return  # a flush is already scheduled and will serialize the latest state
+
+    async def _flush():
+        try:
+            await asyncio.sleep(0.25)  # coalesce bursts of turns into one write
+            _atomic_write_json(CHAT_MEMORY_FILE, _serialize_chat_memory())
+        except Exception as e:
+            log_event("warning", "chat_memory_persist_failed", error=f"{type(e).__name__}: {e}")
+
+    _CHAT_MEMORY_FLUSH_TASK = loop.create_task(_flush())
 
 
 # Short-term conversation memory per user (max 8 turns per user, max 500 users in RAM, persisted to disk)
@@ -1274,30 +1355,71 @@ class GeminiRateLimiter:
         cd = 0.2 if is_privileged else self.user_cooldown
         return max(0.0, cd - (now - last))
 
-    async def acquire_slot(self, user_id: int, is_internal_subcall: bool = False):
-        async with self.lock:
-            now = time.monotonic()
-            today = datetime.datetime.now(datetime.timezone.utc).date()
-            if today != self.daily_reset:
-                self.daily_count = 0
-                self.daily_reset = today
+    def _prune_user_map(self, now: float) -> None:
+        """Bounded-memory guard: `user_last_request` must never grow without limit."""
+        if len(self.user_last_request) <= 2048:
+            return
+        cutoff = now - 900.0  # 15 minutes
+        self.user_last_request = {
+            uid: ts for uid, ts in self.user_last_request.items() if ts >= cutoff
+        }
 
-            while (
-                self.request_timestamps
-                and now - self.request_timestamps[0] >= 60.0
-            ):
-                self.request_timestamps.popleft()
+    async def acquire_slot(self, user_id: int, is_internal_subcall: bool = False, max_wait_sec: float = 5.0):
+        """
+        Non-blocking-by-design pacing gate with real RPM enforcement:
+        - Sleeps OUTSIDE the lock so concurrent callers are never serialized behind a wait.
+        - Waits until a rolling-window slot frees (bounded to `max_wait_sec`) instead of
+          blindly appending over the cap, so bursts can no longer self-inflict HTTP 429s.
+        - After the bounded wait elapses the request proceeds anyway (soft-landing) and the
+          overage is logged — user responsiveness always wins over perfect pacing.
+        """
+        wait_deadline = time.monotonic() + max_wait_sec
+        while True:
+            async with self.lock:
+                now = time.monotonic()
+                today = datetime.datetime.now(datetime.timezone.utc).date()
+                if today != self.daily_reset:
+                    self.daily_count = 0
+                    self.daily_reset = today
 
-            if len(self.request_timestamps) >= self.max_rpm:
+                while (
+                    self.request_timestamps
+                    and now - self.request_timestamps[0] >= 60.0
+                ):
+                    self.request_timestamps.popleft()
+
+                if len(self.request_timestamps) < self.max_rpm:
+                    self.request_timestamps.append(now)
+                    if user_id and not is_internal_subcall:
+                        self._prune_user_map(now)
+                        self.user_last_request[user_id] = now
+                    self.daily_count += 1
+                    return
+
                 wait_time = min(
-                    0.6, max(0.1, 60.0 - (now - self.request_timestamps[0]))
+                    0.5, max(0.05, 60.0 - (now - self.request_timestamps[0]))
                 )
-                await asyncio.sleep(wait_time)
 
-            self.request_timestamps.append(time.monotonic())
-            if user_id and not is_internal_subcall:
-                self.user_last_request[user_id] = time.monotonic()
-            self.daily_count += 1
+            # Sleep WITHOUT holding the lock so other callers can proceed/queue concurrently.
+            if time.monotonic() + wait_time > wait_deadline:
+                # Bounded wait exhausted — proceed anyway (legacy soft-limit behavior) with a
+                # structured diagnostic instead of stalling the user indefinitely.
+                async with self.lock:
+                    now = time.monotonic()
+                    self.request_timestamps.append(now)
+                    if user_id and not is_internal_subcall:
+                        self._prune_user_map(now)
+                        self.user_last_request[user_id] = now
+                    self.daily_count += 1
+                log_event(
+                    "warning",
+                    "rate_limiter_soft_overage",
+                    rpm_window=len(self.request_timestamps),
+                    max_rpm=self.max_rpm,
+                    waited_sec=round(max_wait_sec, 1),
+                )
+                return
+            await asyncio.sleep(wait_time)
 
     def get_status(self) -> tuple[int, int]:
         now = time.monotonic()
@@ -7592,6 +7714,10 @@ async def call_llm_json_mode(prompt: str, system_prompt: str = "") -> str:
         workflow_route_override="INTERNAL_JSON",
     )
     cleaned = raw.strip()
+    # A terminal API failure notice is NOT JSON — return "" so callers fall back cleanly
+    # instead of misparsing the notice text (which could contain braces/brackets from upstream errors).
+    if not cleaned or cleaned.startswith(("🛡️", "⚠️", "🤔", "🔐", "⏳", "⏱️")):
+        return ""
     if "```" in cleaned:
         m = re.search(r"```(?:json)?\s*(.*?)\s*```", cleaned, flags=re.DOTALL | re.IGNORECASE)
         if m:
@@ -7707,7 +7833,16 @@ async def handle_complex_discord_command(
     live_step_context = agent_context
 
     # STEP 2: PYTHON OWNS THE LOOP so the agent CANNOT stop halfway!
-    async with lock:
+    # Bounded lock acquisition: never wait forever behind a stuck/slow chain — report and move on.
+    try:
+        await asyncio.wait_for(lock.acquire(), timeout=60.0)
+    except asyncio.TimeoutError:
+        log_event("warning", "orchestrator_lock_timeout", scope_id=scope_id, planned_steps=len(planned_items))
+        return (
+            "⚠️ The server action queue for this server is busy with another running task. "
+            "Please retry this request in a minute."
+        ), []
+    try:
         for index, item in enumerate(planned_items):
             if isinstance(item, dict) and (item.get("name") in POKA_YOKE_TOOL_NAMES or item.get("tool") in POKA_YOKE_TOOL_NAMES):
                 tool_call = item
@@ -7730,7 +7865,16 @@ async def handle_complex_discord_command(
                 completed_log.append(f"Step {index + 1} ({step_label}): TOOL_ERROR: Worker did not select a valid tool.")
                 continue
 
-            result = await run_discord_tool(source, tool_call, is_full_clearance=full_clearance, user_prompt=user_message)
+            # Error isolation: one failing step must never abort the remaining independent steps.
+            try:
+                result = await run_discord_tool(source, tool_call, is_full_clearance=full_clearance, user_prompt=user_message)
+            except Exception as step_err:
+                log_event(
+                    "error", "orchestrator_step_failed",
+                    step=index + 1, tool=str(tool_call.get("name") or tool_call.get("tool") or "?"),
+                    error=f"{type(step_err).__name__}: {step_err}",
+                )
+                result = f"TOOL_ERROR: Unexpected {type(step_err).__name__}: {step_err}"
             completed_log.append(f"Step {index + 1} ({step_label}): {result}")
 
             # Test 7 Fix: Do NOT abort the entire chain when a single step fails on a missing member/target!
@@ -7739,8 +7883,13 @@ async def handle_complex_discord_command(
                 break
 
             # Refresh Live Discord Ground Truth so the next step sees newly created categories/channels/roles!
-            live_step_context = await build_agent_context(source, user_message)
+            try:
+                live_step_context = await build_agent_context(source, user_message)
+            except Exception as ctx_err:
+                log_event("warning", "orchestrator_context_refresh_failed", error=f"{type(ctx_err).__name__}: {ctx_err}")
             await asyncio.sleep(0.15)
+    finally:
+        lock.release()
 
     # STEP 3: Final synthesis back to the Discord channel
     final_reply = await synthesize_final_discord_reply(user_message, completed_log)
@@ -7778,7 +7927,14 @@ async def execute_internal_bot_commands(
     scope_id = guild.id if guild else author.id
     lock = action_queue.get_lock(scope_id)
 
-    async with lock:
+    # Bounded lock acquisition: never wait forever behind a stuck/slow action chain.
+    try:
+        await asyncio.wait_for(lock.acquire(), timeout=45.0)
+    except asyncio.TimeoutError:
+        log_event("warning", "action_lock_timeout", scope_id=scope_id)
+        notices.append("⚠️ The server action queue is busy with another running task — please retry in a moment.")
+        return clean_text, executed_summaries, extra_embeds, notices
+    try:
         # ------------------------------------------
         # ENGINE 1: Preprogrammed Bot Commands ([[EXEC: ...]])
         # ------------------------------------------
@@ -7937,7 +8093,15 @@ async def execute_internal_bot_commands(
                 or str(api_act.get("action", "")).lower() in POKA_YOKE_TOOL_NAMES
             )
             if is_poka_yoke:
-                res = await run_discord_tool(source, api_act, is_full_clearance=full_clearance, user_prompt=getattr(source, 'content', ''))
+                try:
+                    res = await run_discord_tool(source, api_act, is_full_clearance=full_clearance, user_prompt=getattr(source, 'content', ''))
+                except Exception as tool_err:
+                    log_event(
+                        "error", "tool_execution_crashed",
+                        tool=str(api_act.get("name") or api_act.get("tool") or api_act.get("action") or "?"),
+                        error=f"{type(tool_err).__name__}: {tool_err}",
+                    )
+                    res = f"TOOL_ERROR: Unexpected {type(tool_err).__name__}: {tool_err}"
                 if res.startswith("SUCCESS:"):
                     executed_summaries.append(f"✅ {res[len('SUCCESS:'):].strip()}")
                 else:
@@ -7956,13 +8120,22 @@ async def execute_internal_bot_commands(
         # ENGINE 3: Live On-The-Go Python / Discord API Scripts ([[PY_EXEC: ...]])
         # ------------------------------------------
         for py_code in py_scripts[:3]:
-            s_logs, s_embeds, s_errs = await execute_live_discord_script(
-                source, py_code, full_clearance
-            )
+            try:
+                s_logs, s_embeds, s_errs = await execute_live_discord_script(
+                    source, py_code, full_clearance
+                )
+            except Exception as script_err:
+                log_event(
+                    "error", "live_script_crashed",
+                    error=f"{type(script_err).__name__}: {script_err}",
+                )
+                s_logs, s_embeds, s_errs = [], [], [f"⚠️ Live script crashed: `{type(script_err).__name__}: {script_err}`"]
             executed_summaries.extend(s_logs)
             extra_embeds.extend(s_embeds)
             notices.extend(s_errs)
             await asyncio.sleep(0.5)
+    finally:
+        lock.release()
 
     return clean_text, executed_summaries, extra_embeds, notices
 
@@ -8055,6 +8228,11 @@ def _get_native_gemini_function_declarations(route: str) -> list[dict]:
                 "parameters": _sanitize_gemini_json_schema(t["parameters"]),
             })
     return decls
+
+
+# Global concurrency cap for in-flight Gemini HTTP exchanges: prevents burst traffic from
+# many simultaneous users self-inflicting HTTP 429s on the shared free-tier quota.
+_GENERATION_SEMAPHORE = asyncio.Semaphore(6)
 
 
 async def generate_gemini_response(
@@ -8279,6 +8457,7 @@ async def generate_gemini_response(
         return payload_obj
 
     last_error = ""
+    last_error_class = "unknown"
     session = bot.http_session
     close_after = False
     if session is None or session.closed:
@@ -8296,184 +8475,331 @@ async def generate_gemini_response(
         if AI_CONFIG.get("strict_no_fallback", False):
             break
 
+    # ---- Bounded latency budget + classified retry policy ---------------------------------------
+    # Every request path is bounded: per-attempt timeouts, per-tier exponential backoff (jittered,
+    # Retry-After aware) for TRANSIENT failures only (network / 429 / 5xx), and a hard total budget
+    # so no failure can leave the caller waiting indefinitely. Auth errors (401/403) abort the
+    # cascade immediately — the same key would fail on every tier, so retrying wastes quota.
+    total_budget_sec = 90.0 if effective_thinking in ("high", "xhigh") else 60.0
+    deadline = time.monotonic() + total_budget_sec
+    max_same_tier_attempts = 3  # 1 initial + up to 2 backoff retries for transient failures
+    abort_cascade = False
+
+    req_headers = {
+        "x-goog-api-key": api_key,
+        "Content-Type": "application/json",
+    }
+
+    def _classify_http_error(status: int) -> tuple[str, bool, bool]:
+        """(error_class, retry_same_tier, abort_cascade) — Gemini REST error taxonomy."""
+        if status == 429:
+            return "rate_limit", True, False
+        if status in (500, 502, 503, 504):
+            return "provider_transient", True, False
+        if status in (401, 403):
+            return "auth", False, True
+        if status in (404, 410):
+            return "model_unavailable", False, False
+        return "invalid_request", False, False
+
+    async def _post_generation(
+        target_model: str,
+        payload: dict,
+        timeout_sec: float,
+        purpose: str,
+        max_attempts: int = 1,
+    ):
+        """
+        One Gemini POST under the global concurrency cap, with bounded exponential backoff
+        (+ jitter, Retry-After aware) for transient failures. Body is read before returning.
+        Returns ("ok", parsed_json, elapsed_sec) on HTTP 200, else
+                ("error", {"class", "status", "message", "retryable", "abort"}, elapsed_sec).
+        """
+        nonlocal last_error, last_error_class
+        final_err: dict = {"class": "unknown", "status": None, "message": "", "retryable": False, "abort": False}
+        for attempt_no in range(1, max_attempts + 1):
+            remaining = deadline - time.monotonic()
+            if remaining <= 2.0:
+                last_error_class = "timeout"
+                last_error = f"latency budget exhausted before {purpose}"
+                return "error", {"class": "timeout", "status": None, "message": last_error, "retryable": False, "abort": True}, 0.0
+
+            t0 = time.monotonic()
+            sem_acquired = False
+            retry_delay: float | None = None
+            try:
+                try:
+                    await asyncio.wait_for(
+                        _GENERATION_SEMAPHORE.acquire(),
+                        timeout=max(1.0, min(15.0, remaining)),
+                    )
+                    sem_acquired = True
+                except asyncio.TimeoutError:
+                    # Soft-bypass our own concurrency cap rather than stalling the user.
+                    log_event("warning", "generation_semaphore_soft_bypass", purpose=purpose)
+
+                try:
+                    async with session.post(
+                        f"https://generativelanguage.googleapis.com/v1beta/models/{target_model}:generateContent",
+                        headers=req_headers,
+                        json=payload,
+                        timeout=aiohttp.ClientTimeout(
+                            total=max(3.0, min(timeout_sec, remaining)),
+                            connect=min(15, max(3.0, remaining)),
+                        ),
+                    ) as resp:
+                        elapsed_sec = round(time.monotonic() - t0, 2)
+                        recovery_chip.last_http_status = resp.status
+                        if resp.status == 200:
+                            data = await resp.json()
+                            return "ok", data, elapsed_sec
+
+                        err_body = (await resp.text())[:220]
+                        err_cls, retryable, abort_flag = _classify_http_error(resp.status)
+                        detail = ""
+                        try:
+                            err_json = json.loads(err_body)
+                            detail = str((err_json.get("error") or {}).get("message", ""))[:140]
+                        except Exception:
+                            detail = ""
+                        retry_after = None
+                        try:
+                            retry_after = float(resp.headers.get("Retry-After") or 0) or None
+                        except Exception:
+                            retry_after = None
+                        msg = f"HTTP {resp.status} on `{target_model}`" + (f": {detail}" if detail else f" ({err_body})")
+                        last_error, last_error_class = msg, err_cls
+                        final_err = {"class": err_cls, "status": resp.status, "message": msg, "retryable": retryable, "abort": abort_flag}
+                        log_event(
+                            "error" if abort_flag else "warning",
+                            "gemini_http_error",
+                            model=target_model, purpose=purpose, status=resp.status,
+                            error_class=err_cls, attempt=attempt_no, elapsed_sec=elapsed_sec,
+                        )
+                        if retryable and attempt_no < max_attempts and time.monotonic() + 2.0 < deadline:
+                            base = retry_after if retry_after else 0.6 * (2 ** (attempt_no - 1))
+                            retry_delay = min(base + random.uniform(0, 0.3), 8.0)
+                        else:
+                            return "error", final_err, elapsed_sec
+                finally:
+                    if sem_acquired:
+                        _GENERATION_SEMAPHORE.release()
+
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                elapsed_sec = round(time.monotonic() - t0, 2)
+                err_cls = "network" if isinstance(e, (asyncio.TimeoutError, aiohttp.ClientError, OSError)) else "internal"
+                msg = f"{type(e).__name__} on `{target_model}` during {purpose}"
+                last_error, last_error_class = msg, err_cls
+                final_err = {"class": err_cls, "status": None, "message": msg, "retryable": True, "abort": False}
+                log_event(
+                    "warning", "gemini_transport_error",
+                    model=target_model, purpose=purpose,
+                    error=f"{type(e).__name__}: {e}", attempt=attempt_no, elapsed_sec=elapsed_sec,
+                )
+                if attempt_no < max_attempts and time.monotonic() + 2.0 < deadline:
+                    retry_delay = min(0.6 * (2 ** (attempt_no - 1)) + random.uniform(0, 0.3), 8.0)
+                else:
+                    return "error", final_err, elapsed_sec
+
+            if retry_delay is not None:
+                log_event(
+                    "info", "gemini_retry_backoff",
+                    model=target_model, purpose=purpose, attempt=attempt_no,
+                    backoff_sec=round(retry_delay, 2), error_class=final_err.get("class"),
+                )
+                await asyncio.sleep(retry_delay)
+
+        return "error", final_err, 0.0
+
     try:
-        req_headers = {
-            "x-goog-api-key": api_key,
-            "Content-Type": "application/json",
-        }
         for attempt_idx, (model_name, th_case, inc_thoughts) in enumerate(attempt_plan, start=1):
+            if abort_cascade:
+                break
             recovery_chip.total_calls += 1
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
             req_payload = _build_payload_for_model(
                 model_name, think_case=th_case, include_thoughts_flag=inc_thoughts
             )
             sent_th_str = req_payload["generationConfig"].get("thinkingConfig", {}).get("thinkingLevel", effective_thinking)
-            t_start = time.monotonic()
 
-            try:
-                async with session.post(
-                    url,
-                    headers=req_headers,
-                    json=req_payload,
-                    timeout=aiohttp.ClientTimeout(total=req_timeout_sec, connect=15),
-                ) as resp:
-                    elapsed_sec = round(time.monotonic() - t_start, 2)
-                    recovery_chip.last_http_status = resp.status
-                    if resp.status == 200:
-                        data = await resp.json()
+            status_kind, result, elapsed_sec = await _post_generation(
+                model_name, req_payload, req_timeout_sec,
+                purpose=f"generateContent:{model_name}",
+                max_attempts=max_same_tier_attempts,
+            )
+
+            if status_kind == "ok":
+                data = result
+                candidates = data.get("candidates", [])
+                reply_text, finish_reason, thought_summary = _extract_reply_and_native_tool_calls(candidates)
+
+                # Recover immediately from MALFORMED_FUNCTION_CALL or MAX_TOKENS empty output
+                if not reply_text:
+                    use_tools_retry = (finish_reason == "MALFORMED_FUNCTION_CALL")
+                    recovery_payload = _build_payload_for_model(
+                        model_name,
+                        think_case="lower",
+                        include_thoughts_flag=False,
+                        include_native_tools=use_tools_retry,
+                        force_low_thinking=True,
+                    )
+                    rec_kind, rec_result, rec_elapsed = await _post_generation(
+                        model_name, recovery_payload, 14.0,
+                        purpose=f"empty-output-recovery:{model_name}",
+                        max_attempts=1,
+                    )
+                    elapsed_sec = round(elapsed_sec + rec_elapsed, 2)
+                    if rec_kind == "ok":
+                        data = rec_result
                         candidates = data.get("candidates", [])
                         reply_text, finish_reason, thought_summary = _extract_reply_and_native_tool_calls(candidates)
 
-                        # Recover immediately from MALFORMED_FUNCTION_CALL or MAX_TOKENS empty output
-                        if not reply_text:
-                            use_tools_retry = (finish_reason == "MALFORMED_FUNCTION_CALL")
-                            recovery_payload = _build_payload_for_model(
-                                model_name,
-                                think_case="lower",
-                                include_thoughts_flag=False,
-                                include_native_tools=use_tools_retry,
-                                force_low_thinking=True,
-                            )
-                            t_start_retry = time.monotonic()
-                            async with session.post(
-                                url,
-                                headers=req_headers,
-                                json=recovery_payload,
-                                timeout=aiohttp.ClientTimeout(total=14, connect=8),
-                            ) as tool_retry_resp:
-                                elapsed_sec = round(time.monotonic() - t_start_retry, 2)
-                                if tool_retry_resp.status == 200:
-                                    data = await tool_retry_resp.json()
-                                    candidates = data.get("candidates", [])
-                                    reply_text, finish_reason, thought_summary = _extract_reply_and_native_tool_calls(candidates)
+                if not reply_text:
+                    recovery_chip.mark_unhealthy(
+                        model_name, f"Empty output ({finish_reason})", cooldown_sec=5
+                    )
+                    last_error = f"Empty response ({finish_reason}) on `{model_name}`"
+                    last_error_class = "empty_output"
+                    if model_name == PRIMARY_GEMINI_MODEL:
+                        AI_CONFIG["last_hydrogen_error"] = last_error
+                    log_event("warning", "gemini_empty_output", model=model_name, finish_reason=finish_reason)
+                    continue
 
-                        if not reply_text:
-                            recovery_chip.mark_unhealthy(
-                                model_name, f"Empty output ({finish_reason})", cooldown_sec=5
-                            )
-                            last_error = f"Empty response ({finish_reason}) on `{model_name}`"
-                            if model_name == PRIMARY_GEMINI_MODEL:
-                                AI_CONFIG["last_hydrogen_error"] = last_error
-                            continue
+                api_model_ver = str(data.get("modelVersion") or model_name).replace("models/", "")
+                usage_meta = data.get("usageMetadata") or {}
+                thought_toks = int(usage_meta.get("thoughtsTokenCount") or 0)
+                out_toks = int(usage_meta.get("candidatesTokenCount") or 0)
+                in_toks = int(usage_meta.get("promptTokenCount") or 0)
 
-                        api_model_ver = str(data.get("modelVersion") or model_name).replace("models/", "")
-                        usage_meta = data.get("usageMetadata") or {}
-                        thought_toks = int(usage_meta.get("thoughtsTokenCount") or 0)
-                        out_toks = int(usage_meta.get("candidatesTokenCount") or 0)
-                        in_toks = int(usage_meta.get("promptTokenCount") or 0)
-
-                        AI_CONFIG["last_api_model_version"] = api_model_ver
-                        AI_CONFIG["last_routed_endpoint"] = model_name
-                        AI_CONFIG["last_latency_sec"] = elapsed_sec
-                        AI_CONFIG["last_sent_thinking_level"] = str(sent_th_str).upper()
-                        if thought_summary:
-                            AI_CONFIG["last_thought_summary"] = thought_summary[:1500]
-                        AI_CONFIG["verified_live"] = True
-                        AI_CONFIG["verified_at"] = datetime.datetime.now(datetime.timezone.utc).strftime(
-                            "%Y-%m-%d %H:%M:%S UTC"
-                        )
-                        if model_name == PRIMARY_GEMINI_MODEL:
-                            AI_CONFIG["last_hydrogen_error"] = None
-                        if isinstance(usage_meta, dict) and usage_meta:
-                            AI_CONFIG["last_usage_metadata"] = usage_meta
-                            AI_CONFIG["total_tokens_used"] = int(AI_CONFIG.get("total_tokens_used", 0)) + int(
-                                usage_meta.get("totalTokenCount") or 0
-                            )
-
-                        recovery_chip.successful_calls += 1
-                        recovery_chip.mark_healthy(model_name)
-
-                        if not is_internal_subcall and route != "INTERNAL_JSON" and AI_CONFIG.get("chat_mode", "discord") == "discord":
-                            reply_text = _apply_discord_user_mode_style(reply_text)
-
-                        if use_memory:
-                            clean_mem, _, _, _ = (
-                                SecuritySanitizerChip.extract_and_sanitize(
-                                    reply_text
-                                )
-                            )
-                            record_user_chat_turn(user_id, user_name, prompt, persist=False)
-                            record_user_chat_turn(user_id, "Aviyl AI", clean_mem[:600], persist=True)
-
-                        # Attach optional Thought Process spoiler & live telemetry footer on visible user turns (never on INTERNAL_JSON)
-                        if not is_internal_subcall and route != "INTERNAL_JSON":
-                            extra_blocks = []
-                            if AI_CONFIG.get("show_thought_process") and thought_summary:
-                                short_th = thought_summary[:700] + ("..." if len(thought_summary) > 700 else "")
-                                extra_blocks.append(f"||💭 **Thought Process ({sent_th_str.upper()} • {thought_toks} tokens):**\n{short_th}||")
-                            if AI_CONFIG.get("show_telemetry_footer", True):
-                                extra_blocks.append(
-                                    f"-# ⚡ Model: `{api_model_ver}` • Effort: `{str(sent_th_str).upper()}` • Thinking Tokens: `{thought_toks:,}` • Output: `{out_toks:,}` • Time: `{elapsed_sec}s`"
-                                )
-                            if extra_blocks:
-                                # Keep any [[TOOL_CALL:...]] / [[EXEC:...]] tags cleanly extractable while placing footer at end of visible text
-                                reply_text = reply_text + "\n" + "\n".join(extra_blocks)
-
-                        return reply_text
-
-                    elif resp.status == 400:
-                        err_body = (await resp.text())[:220]
-                        last_error = f"HTTP 400 on `{model_name}` ({err_body})"
-                        if model_name == PRIMARY_GEMINI_MODEL:
-                            AI_CONFIG["last_hydrogen_error"] = last_error
-                        # Fast inline retry with lowercase thinkingLevel if uppercase was rejected
-                        if "thinking" in err_body.lower() and th_case == "upper":
-                            retry_p = _build_payload_for_model(model_name, think_case="lower", include_thoughts_flag=False)
-                            async with session.post(url, headers=req_headers, json=retry_p, timeout=aiohttp.ClientTimeout(total=req_timeout_sec, connect=10)) as r400:
-                                if r400.status == 200:
-                                    data = await r400.json()
-                                    candidates = data.get("candidates", [])
-                                    reply_text, finish_reason, thought_summary = _extract_reply_and_native_tool_calls(candidates)
-                                    if reply_text:
-                                        api_model_ver = str(data.get("modelVersion") or model_name).replace("models/", "")
-                                        AI_CONFIG["last_api_model_version"] = api_model_ver
-                                        AI_CONFIG["last_routed_endpoint"] = model_name
-                                        AI_CONFIG["verified_live"] = True
-                                        recovery_chip.successful_calls += 1
-                                        recovery_chip.mark_healthy(model_name)
-                                        return reply_text
-                        continue
-
-                    elif resp.status in (429, 500, 502, 503, 504):
-                        upstream_msg = ""
-                        try:
-                            err_json = await resp.json()
-                            upstream_msg = err_json.get("error", {}).get("message", "")
-                        except Exception:
-                            pass
-                        recovery_chip.mark_unhealthy(
-                            model_name,
-                            f"HTTP {resp.status}",
-                            cooldown_sec=60.0 if resp.status == 429 else 15.0,
-                        )
-                        detail_suffix = f": {upstream_msg[:140]}" if upstream_msg else ""
-                        last_error = f"HTTP {resp.status} on `{model_name}`{detail_suffix}"
-                        if model_name == PRIMARY_GEMINI_MODEL:
-                            AI_CONFIG["last_hydrogen_error"] = last_error
-                        continue
-
-                    else:
-                        err_body = (await resp.text())[:200]
-                        recovery_chip.mark_unhealthy(
-                            model_name, f"HTTP {resp.status}", cooldown_sec=10
-                        )
-                        last_error = f"HTTP {resp.status} on `{model_name}` ({err_body})"
-                        if model_name == PRIMARY_GEMINI_MODEL:
-                            AI_CONFIG["last_hydrogen_error"] = last_error
-                        break
-
-            except Exception as e:
-                recovery_chip.mark_unhealthy(
-                    model_name, type(e).__name__, cooldown_sec=30.0
+                AI_CONFIG["last_api_model_version"] = api_model_ver
+                AI_CONFIG["last_routed_endpoint"] = model_name
+                AI_CONFIG["last_latency_sec"] = elapsed_sec
+                AI_CONFIG["last_sent_thinking_level"] = str(sent_th_str).upper()
+                if thought_summary:
+                    AI_CONFIG["last_thought_summary"] = thought_summary[:1500]
+                AI_CONFIG["verified_live"] = True
+                AI_CONFIG["verified_at"] = datetime.datetime.now(datetime.timezone.utc).strftime(
+                    "%Y-%m-%d %H:%M:%S UTC"
                 )
-                last_error = f"{type(e).__name__} on `{model_name}` (Thinking: `{effective_thinking.upper()}`)"
+                if model_name == PRIMARY_GEMINI_MODEL:
+                    AI_CONFIG["last_hydrogen_error"] = None
+                if isinstance(usage_meta, dict) and usage_meta:
+                    AI_CONFIG["last_usage_metadata"] = usage_meta
+                    AI_CONFIG["total_tokens_used"] = int(AI_CONFIG.get("total_tokens_used", 0)) + int(
+                        usage_meta.get("totalTokenCount") or 0
+                    )
+
+                recovery_chip.successful_calls += 1
+                recovery_chip.mark_healthy(model_name)
+                log_event(
+                    "info", "gemini_success",
+                    model=api_model_ver, routed_endpoint=model_name, route=route,
+                    thinking=str(sent_th_str), latency_sec=elapsed_sec,
+                    in_tokens=in_toks, out_tokens=out_toks, thought_tokens=thought_toks,
+                    finish_reason=finish_reason,
+                )
+
+                if not is_internal_subcall and route != "INTERNAL_JSON" and AI_CONFIG.get("chat_mode", "discord") == "discord":
+                    reply_text = _apply_discord_user_mode_style(reply_text)
+
+                if use_memory:
+                    clean_mem, _, _, _ = (
+                        SecuritySanitizerChip.extract_and_sanitize(
+                            reply_text
+                        )
+                    )
+                    record_user_chat_turn(user_id, user_name, prompt, persist=False)
+                    record_user_chat_turn(user_id, "Aviyl AI", clean_mem[:600], persist=True)
+
+                # Attach optional Thought Process spoiler & live telemetry footer on visible user turns (never on INTERNAL_JSON)
+                if not is_internal_subcall and route != "INTERNAL_JSON":
+                    extra_blocks = []
+                    if AI_CONFIG.get("show_thought_process") and thought_summary:
+                        short_th = thought_summary[:700] + ("..." if len(thought_summary) > 700 else "")
+                        extra_blocks.append(f"||💭 **Thought Process ({sent_th_str.upper()} • {thought_toks} tokens):**\n{short_th}||")
+                    if AI_CONFIG.get("show_telemetry_footer", True):
+                        extra_blocks.append(
+                            f"-# ⚡ Model: `{api_model_ver}` • Effort: `{str(sent_th_str).upper()}` • Thinking Tokens: `{thought_toks:,}` • Output: `{out_toks:,}` • Time: `{elapsed_sec}s`"
+                        )
+                    if extra_blocks:
+                        # Keep any [[TOOL_CALL:...]] / [[EXEC:...]] tags cleanly extractable while placing footer at end of visible text
+                        reply_text = reply_text + "\n" + "\n".join(extra_blocks)
+
+                return reply_text
+
+            # ---- Classified non-200 handling (error taxonomy) ---------------------------------
+            err_cls = str(result.get("class") or "unknown")
+            err_status = result.get("status")
+
+            if result.get("abort"):
+                abort_cascade = True
                 if model_name == PRIMARY_GEMINI_MODEL:
                     AI_CONFIG["last_hydrogen_error"] = last_error
+                break
+
+            if err_status == 400 and "thinking" in last_error.lower() and th_case == "upper":
+                # Fast inline retry with lowercase thinkingLevel if uppercase was rejected
+                retry_p = _build_payload_for_model(model_name, think_case="lower", include_thoughts_flag=False)
+                r_kind, r_result, _ = await _post_generation(
+                    model_name, retry_p, req_timeout_sec,
+                    purpose=f"400-thinking-fix:{model_name}",
+                    max_attempts=1,
+                )
+                if r_kind == "ok":
+                    data = r_result
+                    candidates = data.get("candidates", [])
+                    reply_text, finish_reason, thought_summary = _extract_reply_and_native_tool_calls(candidates)
+                    if reply_text:
+                        api_model_ver = str(data.get("modelVersion") or model_name).replace("models/", "")
+                        AI_CONFIG["last_api_model_version"] = api_model_ver
+                        AI_CONFIG["last_routed_endpoint"] = model_name
+                        AI_CONFIG["verified_live"] = True
+                        recovery_chip.successful_calls += 1
+                        recovery_chip.mark_healthy(model_name)
+                        log_event("info", "gemini_success", model=api_model_ver, routed_endpoint=model_name, recovery="400-thinking-fix", latency_sec=elapsed_sec)
+                        return reply_text
                 continue
+
+            if err_cls == "rate_limit":
+                recovery_chip.mark_unhealthy(model_name, f"HTTP {err_status}", cooldown_sec=60.0)
+            elif err_cls == "provider_transient":
+                recovery_chip.mark_unhealthy(model_name, f"HTTP {err_status}", cooldown_sec=15.0)
+            elif err_cls == "model_unavailable":
+                recovery_chip.mark_unhealthy(model_name, f"HTTP {err_status}", cooldown_sec=300.0)
+            elif err_cls in ("network", "internal"):
+                recovery_chip.mark_unhealthy(model_name, err_cls, cooldown_sec=30.0)
+
+            if model_name == PRIMARY_GEMINI_MODEL:
+                AI_CONFIG["last_hydrogen_error"] = last_error
+            # Fail over to the next tier in the cascade (legacy behavior, now classified + logged).
+            continue
     finally:
         if close_after:
             await session.close()
 
+    # Classified terminal failure — every code path above is bounded, so the caller ALWAYS gets a reply.
+    log_event(
+        "error", "gemini_request_failed",
+        model=active_model, thinking=effective_thinking, error_class=last_error_class,
+        error=last_error, total_calls=recovery_chip.total_calls,
+    )
+    if last_error_class == "auth":
+        return (
+            "🔐 **Gemini API Authentication Failed (HTTP 401/403):** The configured `GEMINI_API_KEY` was rejected by Google.\n"
+            "👉 Fix: verify `GEMINI_API_KEY` in your `.env` file. (This was NOT retried — retries cannot fix invalid credentials.)"
+        )
+    if last_error_class == "rate_limit":
+        return (
+            f"⏳ **Gemini API Rate Limited:** All model tiers are temporarily over quota (`{last_error}`).\n"
+            "👉 The bot auto-backs off and recovers automatically; try again in ~30–60s or run `!thinking low` to reduce token usage."
+        )
+    if last_error_class == "timeout":
+        return (
+            f"⏱️ **Gemini API Timed Out:** The request exceeded its latency budget (`{last_error}`).\n"
+            "👉 Try again, or run `!thinking low` for the fastest responses."
+        )
     return (
         f"🛡️ **Gemini 4 Hydrogen API Notice:** Request to `{active_model}` (Thinking: `{effective_thinking.upper()}`) could not be completed (`{last_error}`).\n"
         f"👉 Tip: Check `!aistatus` for live API telemetry or run `!thinking low` for lowest latency!"
@@ -8709,20 +9035,20 @@ async def run_prompt_chaining_workflow(
                 guild, target_ch, content=clean_draft, embed=None, username=guild.name
             )
     else:
-        if forbids_embed:
+        label = "plain-text announcement" if forbids_embed else "announcement"
+        try:
             allowed = discord.AllowedMentions(everyone=False, users=True, roles=True)
             for chunk in split_discord_message(clean_draft, limit=1950):
                 sent_m = await target_ch.send(chunk, allowed_mentions=allowed)
                 if hasattr(target_ch, "id") and isinstance(sent_m, discord.Message):
                     LAST_BOT_MESSAGES[target_ch.id] = sent_m
-            res = f"SUCCESS: Sent plain-text announcement in {getattr(target_ch, 'mention', '#announcements')}."
-        else:
-            allowed = discord.AllowedMentions(everyone=False, users=True, roles=True)
-            for chunk in split_discord_message(clean_draft, limit=1950):
-                sent_m = await target_ch.send(chunk, allowed_mentions=allowed)
-                if hasattr(target_ch, "id") and isinstance(sent_m, discord.Message):
-                    LAST_BOT_MESSAGES[target_ch.id] = sent_m
-            res = f"SUCCESS: Sent announcement in {getattr(target_ch, 'mention', '#announcements')}."
+            res = f"SUCCESS: Sent {label} in {getattr(target_ch, 'mention', '#announcements')}."
+        except Exception as send_err:
+            log_event(
+                "error", "chained_announcement_send_failed",
+                error=f"{type(send_err).__name__}: {send_err}",
+            )
+            res = f"TOOL_ERROR: Could not send in {getattr(target_ch, 'mention', 'the channel')}: `{type(send_err).__name__}: {send_err}`"
 
     if res.startswith("SUCCESS:"):
         return f"✅ {res[len('SUCCESS:'):].strip()}", []
@@ -8819,12 +9145,36 @@ async def run_ai_and_dispatch(
         return clean_f_msg, []
 
     # Pattern 3: Parallelization (Context + Sectioning + Multimodal Extraction + Gemini Decision 1 Pre-Flight!)
-    agent_ctx, sectioning, (mm_parts, mm_text), decision_res = await asyncio.gather(
+    # return_exceptions=True: one failing subsystem degrades to a safe default instead of killing the reply.
+    gather_results = await asyncio.gather(
         build_agent_context(source, prompt),
         run_parallel_sectioning_guardrails(source, prompt),
         extract_multimodal_inputs_from_source(source, prompt),
         run_gemini_decision_engine(prompt, is_full_clearance=full_clearance),
+        return_exceptions=True,
     )
+    for sub_name, sub_res in zip(
+        ("build_agent_context", "sectioning_guardrails", "multimodal_extract", "decision_engine"),
+        gather_results,
+    ):
+        if isinstance(sub_res, BaseException):
+            log_event(
+                "error", "pipeline_stage_failed",
+                stage=sub_name, error=f"{type(sub_res).__name__}: {sub_res}",
+            )
+    agent_ctx = gather_results[0] if not isinstance(gather_results[0], BaseException) else ""
+    sectioning = gather_results[1] if not isinstance(gather_results[1], BaseException) else {
+        "forbids_embed": False,
+        "wants_webhook": False,
+        "explicitly_creates_channel": False,
+        "target_channel": None,
+    }
+    mm_parts, mm_text = (
+        gather_results[2]
+        if not isinstance(gather_results[2], BaseException)
+        else ([], "")
+    )
+    decision_res = gather_results[3] if not isinstance(gather_results[3], BaseException) else {}
     if mm_text:
         agent_ctx += f"\n\n[MULTIMODAL MEDIA, GIF & FILE INPUTS IN THIS TURN]:\n{mm_text}"
     if pre_switched_model:
@@ -9351,17 +9701,30 @@ async def on_ready():
         )
 
     try:
-        synced = await bot.tree.sync()
-        print(
-            f"✅ Synced {len(synced)} global hybrid/slash commands for DMs & Servers!"
-        )
-        # Also sync immediately to each active guild so new slash commands (/mode, /mod, /thinking, /layout) appear instantly without Discord's 1-hour global cache delay!
+        # Sync global commands ONCE per process lifetime. on_ready fires on EVERY reconnect;
+        # re-syncing globally + per-guild each time causes Discord sync rate-limit errors on
+        # reconnect storms (one of the sources of intermittent "API errors").
+        if not getattr(bot, "_global_slash_synced", False):
+            bot._global_slash_synced = True
+            synced = await bot.tree.sync()
+            print(
+                f"✅ Synced {len(synced)} global hybrid/slash commands for DMs & Servers!"
+            )
+        else:
+            log_event("info", "slash_sync_skipped_reconnect")
+        # Per-guild instant sync (avoids Discord's 1-hour global cache delay) — only for guilds
+        # that have not been synced yet this session, so reconnects never trigger sync storms.
+        if not hasattr(bot, "_guild_slash_synced_ids"):
+            bot._guild_slash_synced_ids = set()
         for g in list(bot.guilds)[:15]:
+            if g.id in bot._guild_slash_synced_ids:
+                continue
             try:
                 bot.tree.copy_global_to(guild=g)
                 await bot.tree.sync(guild=g)
-            except Exception:
-                pass
+                bot._guild_slash_synced_ids.add(g.id)
+            except Exception as g_sync_err:
+                log_event("warning", "guild_slash_sync_failed", guild_id=g.id, error=f"{type(g_sync_err).__name__}: {g_sync_err}")
     except Exception as e:
         print(f"⚠️ Slash Sync notice: {e}")
 
@@ -9374,6 +9737,14 @@ async def on_ready():
 # Tracks active human-like back-and-forth conversations per (channel_id, user_id) -> monotonic timestamp
 ACTIVE_CONVERSATION_SESSIONS: dict[tuple[int, int], float] = {}
 ACTIVE_CONVERSATION_WINDOW_SEC = 90.0
+
+# Hard watchdog for one full AI dispatch (context build + generation + tool execution):
+# guarantees every request reaches a terminal state (reply or error notice) instead of hanging forever.
+AI_DISPATCH_WATCHDOG_SEC = 300.0
+
+# Gateway redelivery / reconnect duplicate guard: message_id -> monotonic timestamp of first delivery.
+SEEN_MESSAGE_IDS: dict[int, float] = {}
+SEEN_MESSAGE_IDS_TTL_SEC = 120.0
 
 # Tracks when a user last triggered Discord's `on_typing` indicator per (channel_id, user_id)
 USER_LAST_TYPING_TS: dict[tuple[int, int], float] = {}
@@ -9561,23 +9932,51 @@ async def _process_buffered_user_burst(sess_key: tuple[int, int], my_generation:
             "bol? kya kaam hai?",
             f"haan {target_message.author.display_name}, sun raha hu bol?",
         ]
-        sent_ping = await target_message.reply(
-            random.choice(casual_ping_replies),
-            mention_author=True,
-            allowed_mentions=allowed_pings,
-        )
-        LAST_BOT_MESSAGES[target_message.channel.id] = sent_ping
+        try:
+            sent_ping = await target_message.reply(
+                random.choice(casual_ping_replies),
+                mention_author=True,
+                allowed_mentions=allowed_pings,
+            )
+            LAST_BOT_MESSAGES[target_message.channel.id] = sent_ping
+        except Exception as ping_err:
+            log_event("warning", "casual_ping_reply_failed", sess_key=sess_key, error=f"{type(ping_err).__name__}: {ping_err}")
         return
 
     if not os.getenv("GEMINI_API_KEY"):
         USER_MESSAGE_BURST_BUFFER.pop(sess_key, None)
         return
 
-    async with target_message.channel.typing():
-        plain_reply, extra_embeds = await run_ai_and_dispatch(
-            target_message, combined_prompt
+    # ---- Fault-tolerant dispatch: NO failure may ever leave the user silently unresponsive ----
+    plain_reply, extra_embeds = "", []
+    try:
+        async with target_message.channel.typing():
+            plain_reply, extra_embeds = await asyncio.wait_for(
+                run_ai_and_dispatch(target_message, combined_prompt),
+                timeout=AI_DISPATCH_WATCHDOG_SEC,
+            )
+    except asyncio.TimeoutError:
+        log_event(
+            "error", "ai_dispatch_watchdog_timeout",
+            sess_key=sess_key, timeout_sec=AI_DISPATCH_WATCHDOG_SEC,
         )
+        plain_reply, extra_embeds = (
+            f"⚠️ {target_message.author.mention}, that request took too long and was safely stopped after "
+            f"`{int(AI_DISPATCH_WATCHDOG_SEC)}s`. Please try again — or run `!thinking low` for the fastest responses."
+        ), []
+    except asyncio.CancelledError:
+        raise
+    except Exception as dispatch_err:
+        log_event(
+            "error", "ai_dispatch_crashed",
+            sess_key=sess_key, error=f"{type(dispatch_err).__name__}: {dispatch_err}",
+        )
+        plain_reply, extra_embeds = (
+            f"⚠️ {target_message.author.mention}, I hit an internal error while generating a reply "
+            f"(`{type(dispatch_err).__name__}`). It has been logged — please try again."
+        ), []
 
+    try:
         # Check if the user sent ANOTHER line while the AI was thinking!
         latest_state = USER_MESSAGE_BURST_BUFFER.get(sess_key)
         if not latest_state or latest_state.get("generation") != my_generation:
@@ -9608,12 +10007,35 @@ async def _process_buffered_user_burst(sess_key: tuple[int, int], my_generation:
         for emb in extra_embeds:
             sent_e = await target_message.channel.send(embed=emb)
             LAST_BOT_MESSAGES[target_message.channel.id] = sent_e
+    except asyncio.CancelledError:
+        raise
+    except Exception as send_err:
+        # Generation succeeded but delivery failed (missing perms, HTTP error, etc.) — log loudly.
+        log_event(
+            "error", "burst_reply_send_failed",
+            sess_key=sess_key, error=f"{type(send_err).__name__}: {send_err}",
+        )
 
 
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot:
         return
+
+    # Duplicate-delivery guard: gateway redelivery after a reconnect can dispatch the same
+    # MESSAGE_CREATE twice. Processing it again would burn API quota AND double-reply.
+    now_mono = time.monotonic()
+    if message.id in SEEN_MESSAGE_IDS:
+        log_event("info", "duplicate_message_dropped", message_id=message.id, channel_id=getattr(message.channel, "id", 0))
+        return
+    SEEN_MESSAGE_IDS[message.id] = now_mono
+    if len(SEEN_MESSAGE_IDS) > 4096:
+        cutoff = now_mono - SEEN_MESSAGE_IDS_TTL_SEC
+        stale = [mid for mid, ts in SEEN_MESSAGE_IDS.items() if ts < cutoff]
+        for mid in stale:
+            SEEN_MESSAGE_IDS.pop(mid, None)
+        if len(SEEN_MESSAGE_IDS) > 4096:
+            SEEN_MESSAGE_IDS.clear()
 
     ctx = await bot.get_context(message)
     if ctx.valid:
@@ -9716,8 +10138,25 @@ async def ai_cmd(ctx: commands.Context, *, prompt: str):
     if ctx.interaction:
         await ctx.defer()
 
-    async with ctx.typing():
-        plain_reply, task_embeds = await run_ai_and_dispatch(ctx, prompt)
+    try:
+        async with ctx.typing():
+            plain_reply, task_embeds = await asyncio.wait_for(
+                run_ai_and_dispatch(ctx, prompt), timeout=AI_DISPATCH_WATCHDOG_SEC
+            )
+    except asyncio.TimeoutError:
+        log_event("error", "ai_cmd_watchdog_timeout", user_id=ctx.author.id, timeout_sec=AI_DISPATCH_WATCHDOG_SEC)
+        plain_reply, task_embeds = (
+            f"⚠️ That request took too long and was safely stopped after `{int(AI_DISPATCH_WATCHDOG_SEC)}s`. "
+            "Please try again — or run `!thinking low` for the fastest responses."
+        ), []
+    except asyncio.CancelledError:
+        raise
+    except Exception as cmd_err:
+        log_event("error", "ai_cmd_crashed", user_id=ctx.author.id, error=f"{type(cmd_err).__name__}: {cmd_err}")
+        plain_reply, task_embeds = (
+            f"⚠️ I hit an internal error while generating a reply (`{type(cmd_err).__name__}`). "
+            "It has been logged — please try again."
+        ), []
 
     allowed_pings = discord.AllowedMentions(everyone=False, users=True, roles=True, replied_user=True)
     if plain_reply:
@@ -9772,10 +10211,25 @@ async def aiscript_cmd(ctx: commands.Context, *, task: str):
         f"and summarize what you did:\n{task}"
     )
 
-    async with ctx.typing():
-        plain_reply, task_embeds = await run_ai_and_dispatch(
-            ctx, forced_prompt
-        )
+    try:
+        async with ctx.typing():
+            plain_reply, task_embeds = await asyncio.wait_for(
+                run_ai_and_dispatch(ctx, forced_prompt), timeout=AI_DISPATCH_WATCHDOG_SEC
+            )
+    except asyncio.TimeoutError:
+        log_event("error", "aiscript_watchdog_timeout", user_id=ctx.author.id, timeout_sec=AI_DISPATCH_WATCHDOG_SEC)
+        plain_reply, task_embeds = (
+            f"⚠️ That script task took too long and was safely stopped after `{int(AI_DISPATCH_WATCHDOG_SEC)}s`. "
+            "Please try a smaller task."
+        ), []
+    except asyncio.CancelledError:
+        raise
+    except Exception as cmd_err:
+        log_event("error", "aiscript_crashed", user_id=ctx.author.id, error=f"{type(cmd_err).__name__}: {cmd_err}")
+        plain_reply, task_embeds = (
+            f"⚠️ I hit an internal error while running that script task (`{type(cmd_err).__name__}`). "
+            "It has been logged — please try again."
+        ), []
 
     allowed_pings = discord.AllowedMentions(everyone=False, users=True, roles=True, replied_user=True)
     if plain_reply:
@@ -9960,7 +10414,11 @@ async def thinking_cmd(ctx: commands.Context, level: str = None):
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_id}:generateContent"
         headers = {"x-goog-api-key": api_key, "Content-Type": "application/json"}
         results_lines = []
-        session = bot.http_session or aiohttp.ClientSession()
+        session = bot.http_session
+        close_after = False
+        if session is None or session.closed:
+            session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=95, connect=15))
+            close_after = True
         for test_lvl in ("LOW", "XHIGH"):
             t0 = time.monotonic()
             payload = {
@@ -10001,6 +10459,9 @@ async def thinking_cmd(ctx: commands.Context, level: str = None):
                         results_lines.append(f"### 🧪 Effort: `{test_lvl}`\n• **Error (`HTTP {http_code}`):** `{str(data)[:180]}`")
             except Exception as ex:
                 results_lines.append(f"### 🧪 Effort: `{test_lvl}`\n• **Exception:** `{type(ex).__name__}: {ex}`")
+
+        if close_after:
+            await session.close()
 
         emb = discord.Embed(
             title="🔬 Live Google API Proof: `LOW` vs `XHIGH` on `gemini-4-hydrogen`",
@@ -12644,6 +13105,40 @@ async def backup_restore(ctx: commands.Context, confirm: str = None):
 # 🛡️ GLOBAL SECURITY & SMART SYNTAX HANDLER
 # ==========================================
 @bot.event
+async def on_error(event_method: str, *args, **kwargs):
+    """Centralized event-level error sink: structured diagnostics instead of silent crashes."""
+    try:
+        err_txt = traceback.format_exc(limit=8)
+    except Exception:
+        err_txt = "unknown"
+    log_event("error", "event_error", event=str(event_method), traceback=err_txt[-1500:])
+
+
+@bot.tree.error
+async def _on_app_command_error(
+    interaction: discord.Interaction, error: app_commands.AppCommandError
+):
+    """Centralized slash/app-command error sink - always answers the user, never hangs."""
+    original = getattr(error, "original", error)
+    log_event(
+        "error", "app_command_error",
+        command=getattr(interaction.command, "name", None),
+        error=f"{type(original).__name__}: {original}",
+    )
+    try:
+        msg = (
+            f"\u26a0\ufe0f Something went wrong while running that command (`{type(original).__name__}`). "
+            "The issue has been logged \u2014 please try again."
+        )
+        if interaction.response.is_done():
+            await interaction.followup.send(msg, ephemeral=True)
+        else:
+            await interaction.response.send_message(msg, ephemeral=True)
+    except Exception:
+        pass
+
+
+@bot.event
 async def on_command_error(ctx: commands.Context, error):
     if isinstance(error, commands.CommandNotFound):
         return
@@ -12713,6 +13208,43 @@ async def on_command_error(ctx: commands.Context, error):
             color=discord.Color.brand_red(),
         )
         return await ctx.send(embed=embed, ephemeral=True, delete_after=8)
+
+    if isinstance(error, commands.CheckFailure):
+        embed = discord.Embed(
+            title="🔒 Access Denied",
+            description="You don't meet the requirements to run this command.",
+            color=discord.Color.brand_red(),
+        )
+        try:
+            return await ctx.send(embed=embed, ephemeral=True, delete_after=7)
+        except Exception:
+            return
+
+    if isinstance(error, commands.CommandOnCooldown):
+        try:
+            return await ctx.send(
+                f"⏳ **Cooldown Active:** Try again in `{error.retry_after:.1f}s`.",
+                ephemeral=True,
+                delete_after=5,
+            )
+        except Exception:
+            return
+
+    # Generic fallback (unwrapping CommandInvokeError): NEVER leave the user silently unresponsive.
+    original = getattr(error, "original", error)
+    log_event(
+        "error", "command_error_unhandled",
+        command=cmd_name, error=f"{type(original).__name__}: {original}",
+    )
+    try:
+        await ctx.send(
+            f"⚠️ Something went wrong while running `{cmd_name or 'that command'}` "
+            f"(`{type(original).__name__}`). The issue has been logged — please try again.",
+            ephemeral=True,
+            delete_after=10,
+        )
+    except Exception:
+        pass
 
 
 
@@ -14215,6 +14747,89 @@ async def dashboard_cmd(ctx: commands.Context):
             await ctx.send(embed=public_notice)
         except Exception:
             await ctx.send(embed=embed, view=view, delete_after=25)
+
+
+
+# ==========================================
+# 🧹 BACKGROUND HOUSEKEEPING (BOUNDED-MEMORY GUARD)
+# ==========================================
+def _housekeeping_cycle() -> None:
+    """One pruning pass over every transient cache (exposed separately for tests)."""
+    now_mono = time.monotonic()
+
+    # 1) Gateway redelivery guard
+    stale = [mid for mid, ts in SEEN_MESSAGE_IDS.items() if now_mono - ts > SEEN_MESSAGE_IDS_TTL_SEC]
+    for mid in stale:
+        SEEN_MESSAGE_IDS.pop(mid, None)
+
+    # 2) Typing trackers (per channel/user)
+    stale = [k for k, ts in USER_LAST_TYPING_TS.items() if now_mono - ts > 300.0]
+    for k in stale:
+        USER_LAST_TYPING_TS.pop(k, None)
+
+    # 3) Active conversation windows
+    stale = [k for k, ts in ACTIVE_CONVERSATION_SESSIONS.items() if now_mono - ts > ACTIVE_CONVERSATION_WINDOW_SEC * 3]
+    for k in stale:
+        ACTIVE_CONVERSATION_SESSIONS.pop(k, None)
+
+    # 4) Last-bot-message cache (bounded per channel count)
+    if len(LAST_BOT_MESSAGES) > 512:
+        for ch_id in list(LAST_BOT_MESSAGES.keys())[: len(LAST_BOT_MESSAGES) - 512]:
+            LAST_BOT_MESSAGES.pop(ch_id, None)
+
+    # 5) Rate-limiter per-user timestamps
+    ai_limiter._prune_user_map(now_mono)
+
+    # 6) Burst buffers: drop only fully settled entries (done/absent task AND idle)
+    stale = []
+    for key, state in USER_MESSAGE_BURST_BUFFER.items():
+        task = state.get("task")
+        settled = task is None or task.done()
+        if settled and now_mono - float(state.get("last_msg_ts") or 0) > 300.0:
+            stale.append(key)
+    for key in stale:
+        USER_MESSAGE_BURST_BUFFER.pop(key, None)
+
+    # 7) Zero-latency creation caches (bounded per guild)
+    for bucket in (RECENTLY_CREATED_CHANNELS, RECENTLY_CREATED_ROLES, LAST_BULK_CREATED_ROLES):
+        for gid in list(bucket.keys()):
+            if len(bucket[gid]) > 25:
+                bucket[gid] = bucket[gid][-25:]
+
+    # 8) Deleted-object id sets (bounded)
+    for dmap in (DELETED_CHANNEL_IDS, DELETED_ROLE_IDS):
+        for gid in list(dmap.keys()):
+            if len(dmap[gid]) > 2000:
+                dmap[gid] = set(list(dmap[gid])[-2000:])
+
+    # 9) Recently created category pointers
+    stale = [gid for gid, (_cat, ts) in LAST_CREATED_CATEGORY.items() if now_mono - ts > 600.0]
+    for gid in stale:
+        LAST_CREATED_CATEGORY.pop(gid, None)
+
+    # 10) Dashboard failed-login tracker
+    for ip in list(FAILED_LOGIN_ATTEMPTS.keys()):
+        if not FAILED_LOGIN_ATTEMPTS[ip]:
+            FAILED_LOGIN_ATTEMPTS.pop(ip, None)
+    return
+
+
+async def _housekeeping_loop() -> None:
+    """
+    Periodic cache hygiene: every transient in-memory table used by the AI pipeline is
+    age- or size-bounded here so long-running sessions can never leak memory or retain
+    stale state. Runs forever with defensive error isolation - housekeeping must never
+    take the bot down and must never stop quietly.
+    """
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        try:
+            _housekeeping_cycle()
+        except asyncio.CancelledError:
+            raise
+        except Exception as hk_err:
+            log_event("warning", "housekeeping_cycle_failed", error=f"{type(hk_err).__name__}: {hk_err}")
+        await asyncio.sleep(60.0)
 
 
 # ==========================================
